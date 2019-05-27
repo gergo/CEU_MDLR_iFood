@@ -118,29 +118,27 @@ test_generator <- flow_images_from_directory(
   class_mode = NULL
 )
 
-# TODO categories -1?
 predictions <- predict_generator(simple_model, test_generator, steps = 20, verbose = 1)
 predictions
 
 predictions1 <- predictions
 predictions1
-first <- cbind(max.col(predictions1, 'first'))
+# first <- cbind(max.col(predictions1, 'first'))
 first <- apply(predictions1,1,which.max)
 
 # replace max probability category value with -Infinity
 # so in the next iteration it will be ignored
 predictions2 <- t(apply(predictions1, 1, function(x) replace(x, x== max(x), -Inf)))
-second <- cbind(max.col(predictions2, 'first'))
 second <- apply(predictions2,1,which.max)
 
 predictions3 <- t(apply(predictions2, 1, function(x) replace(x, x== max(x), -Inf)))
-third <- cbind(max.col(predictions3, 'first'))
 third <- apply(predictions3,1,which.max)
 
+# categories are indexed from 0, column names are from 1 so subtract 1
 res_df <- tibble(filenames = test_generator$filenames,
-                 cat_1 = first,
-                 cat_2 = second,
-                 cat_3 = third)
+                 cat_1 = first-1,
+                 cat_2 = second-1,
+                 cat_3 = third-1)
 
 res <- res_df %>%
   transform(img_name=str_replace(filenames,"unknown/","")) %>%
@@ -150,6 +148,6 @@ res <- res_df %>%
                           sep = " ")) %>%
   select(img_name, label)
 
-write.csv(res, file = "to_submit.csv", row.names = TRUE)
+write.csv(res, file = "to_submit.csv", row.names = FALSE)
 
 

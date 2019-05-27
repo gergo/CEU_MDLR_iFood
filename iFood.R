@@ -1,228 +1,155 @@
+# devtools::install_github("rstudio/reticulate")
+# devtools::install_github("rstudio/tensorflow")
+# devtools::install_github("rstudio/keras")
+# tensorflow::install_tensorflow()
+
 library(data.table)  
+library(tidyverse)
+library(keras)
+library(magick)
+library(grid)
 
 rm(list = ls())
 default_seed <- 1337
 
+# load data
 setwd("/Users/szekelygergo/kaggle/ifood-2019-fgvc6")
-data_raw <- fread("online-news-popularity/train.csv")
-data_evaluate <- fread("online-news-popularity/test.csv")
+class_list <- read.table("class_list.txt", sep=" ", header=F) %>%
+  rename(id = V1, category = V2)
 
-# transform target variable to factor
-data_raw[, is_popular := factor(is_popular)]
+# not used
+# sample_submission <- read.table("ifood2019_sample_submission.csv", sep=",", header=T)
+# train_labels <- read.table("train_labels.csv", sep=",", header=T)
+# val_labels <- read.table("val_labels.csv", sep=",", header=T)
 
-training_ratio <- 0.7
-set.seed(default_seed)
-train_indices <- createDataPartition(y = data_raw[["is_popular"]],
-                                     times = 1,
-                                     p = training_ratio,
-                                     list = FALSE)
-data_train <- data_raw[train_indices, ]
-data_test <- data_raw[-train_indices, ]
+example_image_path <- file.path("train_set/63/train_063915.jpg")
+image_read(example_image_path)
 
-# remove article_id from training set
-data_train[, c("article_id") := NULL]
+img <- image_load(example_image_path, target_size = c(150, 150))
+x <- image_to_array(img) / 255
+grid::grid.raster(x)
 
-# train + target variables
-y <- "is_popular"
-X <- names(data_train)
-
-h2o.init()
-data_train <- as.h2o(data_train)
-data_test <- as.h2o(data_test)
-data_evaluate <- as.h2o(data_evaluate)
-
-################
-# BASE MODELS  #
-################
-gbm_model <- h2o.gbm(
-  X, y,
-  training_frame = data_train,
-  ntrees = 200,
-  max_depth = 8,
-  learn_rate = 0.1,
-  seed = default_seed,
-  nfolds = 5,
-  keep_cross_validation_predictions = TRUE
+# Use data augmentation:
+train_datagen = image_data_generator(
+  rescale = 1/255,
+  rotation_range = 40,
+  width_shift_range = 0.2,
+  height_shift_range = 0.2,
+  shear_range = 0.2,
+  zoom_range = 0.2,
+  horizontal_flip = TRUE,
+  fill_mode = "nearest"
 )
 
-gbm_model_2 <- h2o.gbm(
-  X, y,
-  training_frame = data_train,
-  ntrees = 250,
-  max_depth = 9,
-  learn_rate = 0.09,
-  seed = default_seed,
-  nfolds = 5,
-  keep_cross_validation_predictions = TRUE
+validation_datagen <- image_data_generator(rescale = 1/255)  
+test_datagen <- image_data_generator(rescale = 1/255)  
+
+# take the previous image as base, multiplication is 
+# only to conform with the image generator's rescale parameter
+xx <- flow_images_from_data(
+  array_reshape(x * 255, c(1, dim(x))),  
+  generator = train_datagen
 )
 
-rf_model <- h2o.randomForest(
-  x = X, y = y,
-  training_frame = data_train,
-  seed = default_seed,
-  nfolds = 5,
-  keep_cross_validation_predictions = TRUE
+augmented_versions <- lapply(1:10, function(ix) generator_next(xx) %>%  {.[1, , , ]})
+
+# see examples by running in console:
+grid::grid.raster(augmented_versions[[4]])
+
+image_size <- c(150, 150)
+batch_size <- 50
+
+train_generator <- flow_images_from_directory(
+  file.path("train_set"), # Target directory  
+  train_datagen,             # Data generator
+  target_size = image_size,  # Resizes all images to 150 × 150
+  batch_size = batch_size,
+  class_mode = "categorical"       # binary_crossentropy loss for binary labels
 )
 
-rf_model_2 <- h2o.randomForest(
-  x = X, y = y,
-  training_frame = data_train,
-  ntrees = 800,
-  max_depth = 9,
-  mtries = 8,
-  stopping_metric = 'AUC',
-  seed = default_seed,
-  nfolds = 5,
-  keep_cross_validation_predictions = TRUE
+validation_generator <- flow_images_from_directory(
+  file.path("val_set"),   
+  validation_datagen,
+  target_size = image_size,
+  batch_size = batch_size,
+  class_mode = "categorical"
 )
 
-cart_model = h2o.gbm(X, y,
-                     training_frame = data_train, 
-                     ntrees = 1, min_rows = 1,
-                     sample_rate = 1, col_sample_rate = 1,
-                     max_depth = 5,
-                     nfolds = 5,
-                     stopping_rounds = 3, stopping_tolerance = 0.01, 
-                     stopping_metric = "AUC", 
-                     seed = default_seed,
-                     keep_cross_validation_predictions = TRUE
+simple_model <- keras_model_sequential() 
+simple_model %>% 
+  layer_conv_2d(filters = 32,
+                kernel_size = c(3, 3), 
+                activation = 'relu',
+                input_shape = c(150, 150, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>% 
+  layer_conv_2d(filters = 16,
+                kernel_size = c(3, 3), 
+                activation = 'relu') %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>% 
+  layer_conv_2d(filters = 16,
+                kernel_size = c(3, 3), 
+                activation = 'relu') %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>% 
+  layer_dropout(rate = 0.25) %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 36, activation = 'relu') %>% 
+  layer_dense(units = 251, activation = "sigmoid")
+
+simple_model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_rmsprop(lr = 2e-5),
+  metrics = c("accuracy")
 )
 
-deeplearning_model_1 <- h2o.deeplearning(
-  X, y,
-  training_frame = data_train,
-  hidden = c(60,30),
-  seed = default_seed,
-  nfolds = 5,
-  keep_cross_validation_predictions = TRUE
+# TODO add early stopping callback
+history <- simple_model %>% fit_generator(
+  train_generator,
+  steps_per_epoch = 2000 / batch_size,
+  epochs = 1, # TODO increase when building the final model
+  validation_data = validation_generator,
+  validation_steps = 50
 )
 
-deeplearning_model_2 <- h2o.deeplearning(
-  X, y,
-  training_frame = data_train,
-  hidden = c(60,60,30),
-  epochs=50,
-  stopping_rounds=3,
-  stopping_metric="misclassification",
-  seed = default_seed,
-  nfolds = 5,
-  keep_cross_validation_predictions = TRUE
+test_generator <- flow_images_from_directory(
+  file.path("test_set"),
+  test_datagen,
+  target_size = image_size,
+  batch_size = 1,
+  class_mode = NULL
 )
 
-glm_model <- h2o.glm(
-  X, y,
-  training_frame = data_train,
-  family = "binomial",
-  alpha = 1,
-  lambda_search = TRUE,
-  seed = default_seed,
-  nfolds = 5,
-  keep_cross_validation_predictions = TRUE
-)
+# TODO categories -1?
+predictions <- predict_generator(simple_model, test_generator, steps = 20, verbose = 1)
+predictions
 
-glm_model_2 <- h2o.glm(
-  X, y,
-  training_frame = data_train,
-  family = "binomial",
-  alpha = 0.5,
-  lambda_search = TRUE,
-  seed = default_seed,
-  nfolds = 5,
-  keep_cross_validation_predictions = TRUE
-)
+predictions1 <- predictions
+predictions1
+first <- cbind(max.col(predictions1, 'first'))
+first <- apply(predictions1,1,which.max)
 
-xgb_model <- h2o.xgboost(X, y,
-                         training_frame = data_train,
-                         distribution = "bernoulli",
-                         ntrees = 200,
-                         max_depth = 9,
-                         min_rows = 1,
-                         learn_rate = 0.1,
-                         sample_rate = 0.7,
-                         col_sample_rate = 0.9,
-                         nfolds = 5,
-                         keep_cross_validation_predictions = TRUE,
-                         seed = default_seed
-)
+# replace max probability category value with -Infinity
+# so in the next iteration it will be ignored
+predictions2 <- t(apply(predictions1, 1, function(x) replace(x, x== max(x), -Inf)))
+second <- cbind(max.col(predictions2, 'first'))
+second <- apply(predictions2,1,which.max)
 
-xgb_model_2 <- h2o.xgboost(X, y,
-                           training_frame = data_train,
-                           distribution = "multinomial",
-                           ntrees = 300,
-                           max_depth = 9,
-                           min_rows = 1,
-                           learn_rate = 0.05,
-                           sample_rate = 0.6,
-                           col_sample_rate = 0.9,
-                           nfolds = 5,
-                           keep_cross_validation_predictions = TRUE,
-                           seed = default_seed
-)
+predictions3 <- t(apply(predictions2, 1, function(x) replace(x, x== max(x), -Inf)))
+third <- cbind(max.col(predictions3, 'first'))
+third <- apply(predictions3,1,which.max)
 
-#############
-# Auto ML   #
-#############
-aml_model <- h2o.automl(X, y,
-                        training_frame = data_train,
-                        max_models = 20,
-                        nfolds = 5,
-                        keep_cross_validation_predictions = TRUE,
-                        seed = default_seed
-)
-aml_best <- aml_model@leader
+res_df <- tibble(filenames = test_generator$filenames,
+                 cat_1 = first,
+                 cat_2 = second,
+                 cat_3 = third)
 
-#####################
-# Model Performance #
-#####################
-h2o.auc(h2o.performance(cart_model, newdata = data_test))
-h2o.auc(h2o.performance(gbm_model, newdata = data_test))
-h2o.auc(h2o.performance(gbm_model_2, newdata = data_test))
-h2o.auc(h2o.performance(rf_model, newdata = data_test))
-h2o.auc(h2o.performance(rf_model_2, newdata = data_test))
-h2o.auc(h2o.performance(deeplearning_model_1, newdata = data_test))
-h2o.auc(h2o.performance(deeplearning_model_2, newdata = data_test))
-h2o.auc(h2o.performance(glm_model, newdata = data_test))
-h2o.auc(h2o.performance(glm_model_2, newdata = data_test))
-h2o.auc(h2o.performance(xgb_model, newdata = data_test))
-h2o.auc(h2o.performance(xgb_model_2, newdata = data_test))
-h2o.auc(h2o.performance(aml_best, newdata = data_test))
+res <- res_df %>%
+  transform(img_name=str_replace(filenames,"unknown/","")) %>%
+  transform(label = str_c(as.character(cat_1),
+                          as.character(cat_2),
+                          as.character(cat_3),
+                          sep = " ")) %>%
+  select(img_name, label)
 
-############
-# ENSEMBLE #
-############
-ensemble_model_deeplearning <- h2o.stackedEnsemble(
-  X, y,
-  training_frame = data_train,
-  metalearner_algorithm = "deeplearning",
-  base_models = list(cart_model,
-                     gbm_model,
-                     gbm_model_2,
-                     rf_model,
-                     rf_model_2,
-                     deeplearning_model_1,
-                     deeplearning_model_2,
-                     glm_model,
-                     glm_model_2,
-                     xgb_model,
-                     xgb_model_2),
-  keep_levelone_frame = TRUE)
-
-h2o.auc(h2o.performance(ensemble_model_deeplearning, newdata = data_test))
+write.csv(res, file = "to_submit.csv", row.names = TRUE)
 
 
-# data_evaluate
-results <- as.data.frame(h2o.predict(ensemble_model_deeplearning, newdata = data_evaluate))
-data_valid_for_submission <- as.data.frame(data_evaluate)
-final <- cbind(data_valid_for_submission, results)
-to_submit <- data.frame(article_id = final$article_id, score = final$p1)
-
-write.csv(to_submit, file = "to_submit.csv", row.names = FALSE)
-
-# write aml_best
-results_aml <- as.data.frame(h2o.predict(aml_best, newdata = data_evaluate))
-data_valid_for_submission_aml <- as.data.frame(data_evaluate)
-final_aml <- cbind(data_valid_for_submission_aml, results_aml)
-to_submit_aml <- data.frame(article_id = final_aml$article_id, score = final_aml$p1)
-write.csv(to_submit_aml, file = "to_submit_aml_best.csv", row.names = FALSE)
-
-h2o.shutdown()
